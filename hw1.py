@@ -12,7 +12,8 @@ import re
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
-
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_deepseek import ChatDeepSeek
 
 QUERY_1 = "How much money did I spend in total for these bills?"
 QUERY_2 = "How much would I have had to pay without the discount?"
@@ -62,7 +63,32 @@ def build_chain() -> Any:
     Use the vision-capable DeepSeek Flash model named
     ``deepseek-v4-flash-vision-exp``. The API key is loaded from .env.
     """
-    ### YOUR CODE HERE
+
+    model = ChatDeepSeek(
+        model="deepseek-v4-flash-vision-exp",
+        temperature=0,
+    )
+
+    prompt = ChatPromptTemplate.from_messages([
+        ("system",
+         "You are a precise Hong Kong supermarket receipt parser. Extract exact monetary amounts.\n\n"
+         "From the receipt, identify:\n"
+         "1. amount_paid: The final amount the customer actually paid AFTER ROUNDING "
+         "(e.g. the amount charged to Octopus, cash, or credit card).\n"
+         "2. subtotal_after_discount: The SUBTOTAL line — after discounts/promotions but BEFORE rounding.\n"
+         "3. discount_total: The sum of ALL discount/promotion/coupon line amounts, as a POSITIVE number. "
+         "Do NOT include ROUNDING.\n\n"
+         "Output ONLY a JSON object with these three keys, values as numbers with 2 decimal places:\n"
+         '{{"amount_paid": 0.00, "subtotal_after_discount": 0.00, "discount_total": 0.00}}\n'
+         "No explanation, no markdown, no extra text."
+        ),
+        ("human", [
+            {"type": "image_url", "image_url": {"url": "{image_url}"}}
+        ]),
+    ])
+
+    return prompt | model
+
     return None
 
 
@@ -78,7 +104,30 @@ def answer_queries(chain: Any, images: list[Path]) -> dict[str, Any]:
     multimodal human messages. LangChain's ``batch`` method is one simple way
     to process independent receipt-extraction prompts in parallel.
     """
-    ### YOUR CODE HERE
+
+    inputs = [{"image_url": image_data_url(img)} for img in images]
+    results = chain.batch(inputs)
+
+    total_paid = Decimal("0")
+    total_without_discount = Decimal("0")
+
+    for result in results:
+        text = result.content if hasattr(result, "content") else str(result)
+        match = re.search(r"\{[^{}]*\}", text, re.DOTALL)
+        if not match:
+            print(f"WARNING: could not parse receipt output: {text!r}")
+            continue
+        data = json.loads(match.group())
+        total_paid += Decimal(str(data["amount_paid"]))
+        subtotal = Decimal(str(data["subtotal_after_discount"]))
+        discount = Decimal(str(data["discount_total"]))
+        total_without_discount += subtotal + discount
+
+    return {
+        QUERY_1: f"HK${total_paid:.2f}",
+        QUERY_2: f"HK${total_without_discount:.2f}",
+    }
+
     _ = (chain, images)
     return {QUERY_1: DUMMY_RESPONSE, QUERY_2: DUMMY_RESPONSE}
 
