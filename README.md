@@ -54,15 +54,16 @@ homework runner.
 
 ```mermaid
 flowchart LR
-    A["Receipt Images<br/>(public_test/*.jpg)"] --> B["base64 encode<br/>image_data_url()"]
-    B --> C["ChatPromptTemplate<br/>system + image message"]
-    C --> D["ChatDeepSeek<br/>deepseek-v4-flash-vision-exp<br/>temperature=0"]
-    D --> E["Parse JSON<br/>amount_paid<br/>subtotal_after_discount<br/>discount_total"]
-    E --> F["Decimal Aggregation<br/>total_paid = sum(amount_paid)<br/>total_without = sum(subtotal + discount)"]
-    F --> G["Output<br/>Query 1: HK$1974.30<br/>Query 2: HK$2348.20"]
+    A["Receipt images<br/>(folder/*.jpg)"] --> B["base64 encode<br/>image_data_url()"]
+    B --> C["Sample K=3 times per receipt<br/>(chain.batch parallel)"]
+    C --> D["ChatPromptTemplate +<br/>ChatDeepSeek vision model<br/>deepseek-v4-flash-vision-exp"]
+    D --> E["Parse JSON per call:<br/>amount_paid, subtotal_after_discount,<br/>discount_lines[], discount_total,<br/>subtotal_before_discount, rounding"]
+    E --> F["Per receipt majority vote<br/>(3 calls -> most common value<br/>per field)"]
+    F --> G["Decimal aggregation:<br/>total_paid = sum(amount_paid)<br/>total_without = sum(subtotal + discount)"]
+    G --> H["Output<br/>Query 1: HK$1974.30<br/>Query 2: HK$2348.20"]
 ```
 
 ### Solution Description
 
-My chain processes each receipt independently and in parallel. For every receipt image, a multimodal prompt asks the DeepSeek vision model (`deepseek-v4-flash-vision-exp`, temperature 0) to extract exactly three structured fields as JSON: (1) `amount_paid` — the final amount tendered after rounding; (2) `subtotal_after_discount` — the SUBTOTAL line after promotions but before rounding; (3) `discount_total` — the sum of all discount/promotion/coupon lines as a positive number, excluding rounding. I deliberately keep the model responsible only for extraction and perform all arithmetic in Python using `Decimal`: `without_discount = subtotal_after_discount + discount_total`, then summed across every receipt. This avoids floating-point drift and prevents the model from hallucinating totals. The chain is built as `ChatPromptTemplate | ChatDeepSeek` and run via `chain.batch()` for parallelism. The final response is formatted as `HK$XXX.XX` containing exactly one number, matching the grader's single-amount parser.
+My chain processes every receipt independently and in parallel. For each receipt image, a multimodal prompt asks the DeepSeek vision model (`deepseek-v4-flash-vision-exp`, temperature 0) to extract structured fields as JSON: the final amount paid after rounding, the SUBTOTAL line after discounts but before rounding, every discount/promotion/coupon line listed individually (as `discount_lines`), the goods subtotal before discounts, and the rounding amount. The prompt instructs the model to read discount amounts from the printed amount column rather than from promotional hint text such as "Buy 2 Save $5", whose number can differ from the actual discount, and to cross-check that `subtotal_after_discount + rounding ≈ amount_paid`. To reduce occasional vision misreads, each receipt is sampled three times and a majority vote is taken per field; the discount total is recomputed in Python by summing the listed discount lines instead of trusting the model's own sum. All arithmetic is done with `Decimal` to avoid floating-point drift: `without_discount = subtotal_after_discount + discount_total`, then summed across all receipts. The chain is built as `ChatPromptTemplate | ChatDeepSeek` and run with `chain.batch()` for parallelism. The final response contains exactly one HKD amount per query, matching the grader's parser.
 

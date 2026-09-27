@@ -7,6 +7,7 @@ import argparse
 import base64
 import csv
 import json
+from collections import Counter
 import mimetypes
 import re
 from decimal import Decimal, InvalidOperation
@@ -71,16 +72,31 @@ def build_chain() -> Any:
 
     prompt = ChatPromptTemplate.from_messages([
         ("system",
-         "You are a precise Hong Kong supermarket receipt parser. Extract exact monetary amounts.\n\n"
-         "From the receipt, identify:\n"
-         "1. amount_paid: The final amount the customer actually paid AFTER ROUNDING "
-         "(e.g. the amount charged to Octopus, cash, or credit card).\n"
-         "2. subtotal_after_discount: The SUBTOTAL line — after discounts/promotions but BEFORE rounding.\n"
-         "3. discount_total: The sum of ALL discount/promotion/coupon line amounts, as a POSITIVE number. "
-         "Do NOT include ROUNDING.\n\n"
-         "Output ONLY a JSON object with these three keys, values as numbers with 2 decimal places:\n"
-         '{{"amount_paid": 0.00, "subtotal_after_discount": 0.00, "discount_total": 0.00}}\n'
-         "No explanation, no markdown, no extra text."
+         "You are a precise Hong Kong supermarket receipt parser. Read the receipt image carefully "
+         "and extract these fields into ONE JSON object:\n\n"
+         '- "subtotal_before_discount": goods total before any discounts (null if not shown)\n'
+         '- "discount_lines": array of objects, each {{"label": "...", "amount": <positive number>}}; '
+         "list EVERY discount/promotion/coupon/offer line separately, do not omit or merge any\n"
+         '- "discount_total": sum of all discount_lines amounts, as a positive number\n'
+         '- "subtotal_after_discount": the SUBTOTAL line after discounts but BEFORE rounding\n'
+         '- "rounding": the ROUNDING amount (e.g. -0.01), use 0 if absent. ROUNDING IS NOT A DISCOUNT; '
+         "never add it to discount_total or discount_lines.\n"
+         '- "amount_paid": the final amount the customer actually paid AFTER rounding '
+         "(Octopus/cash/card)\n\n"
+         "Rules:\n"
+         "1. Read every line twice before answering.\n"
+         "2. discount_total MUST equal the exact sum of discount_lines; recompute it yourself.\n"
+         "3. Cross-check: subtotal_after_discount + rounding should equal amount_paid (within 0.01). "
+         "If not, re-read the receipt and fix the numbers.\n"
+         "4. If unsure about any amount, re-read that region of the image before finalizing.\n\n"
+         "5. Item lines often contain a promotional hint like 'Buy 2 Save $5'; the number in that "
+         "hint may DIFFER from the actual discount printed in the amount column (e.g. -$6.00). "
+         "ALWAYS take the discount amount from the right-hand amount column, never from the hint "
+         "text. Read every discount amount from its printed value.\n\n"
+         "Output ONLY a valid JSON object with exactly these keys: "
+         '"subtotal_before_discount", "discount_lines", "discount_total", '
+         '"subtotal_after_discount", "rounding", "amount_paid". '
+         "No markdown, no explanation, no extra text."
         ),
         ("human", [
             {"type": "image_url", "image_url": {"url": "{image_url}"}}
@@ -88,9 +104,6 @@ def build_chain() -> Any:
     ])
 
     return prompt | model
-
-    return None
-
 
 def answer_queries(chain: Any, images: list[Path]) -> dict[str, Any]:
     """Run your chain and return one response for each exact query string.
@@ -105,23 +118,54 @@ def answer_queries(chain: Any, images: list[Path]) -> dict[str, Any]:
     to process independent receipt-extraction prompts in parallel.
     """
 
-    inputs = [{"image_url": image_data_url(img)} for img in images]
+    K = 3  # 每张收据采样 3 次，取多数答案，提高鲁棒性
+
+    inputs = [{"image_url": image_data_url(img)} for img in images for _ in range(K)]
     results = chain.batch(inputs)
+    per_receipt = [results[i * K:(i + 1) * K] for i in range(len(images))]
 
     total_paid = Decimal("0")
     total_without_discount = Decimal("0")
 
-    for result in results:
-        text = result.content if hasattr(result, "content") else str(result)
-        match = re.search(r"\{[^{}]*\}", text, re.DOTALL)
-        if not match:
-            print(f"WARNING: could not parse receipt output: {text!r}")
+    def extract_json(text: str) -> dict:
+        text = text.strip()
+        if "```" in text:
+            text = text.split("```")[1]
+            if text.startswith("json"):
+                text = text[4:]
+        start = text.find("{")
+        end = text.rfind("}")
+        return json.loads(text[start:end + 1])
+
+    for group in per_receipt:
+        paid_votes, subtotal_votes, discount_votes = [], [], []
+        for result in group:
+            text = result.content if hasattr(result, "content") else str(result)
+            try:
+                data = extract_json(text)
+                lines = data.get("discount_lines") or []
+                discount = (
+                    sum(float(ln["amount"]) for ln in lines)
+                    if lines
+                    else float(data["discount_total"])
+                )
+                paid_votes.append(str(data["amount_paid"]))
+                subtotal_votes.append(str(data["subtotal_after_discount"]))
+                discount_votes.append(f"{discount:.2f}")
+            except Exception:
+                continue
+
+        if not paid_votes:
+            print(f"WARNING: no parseable output for a receipt: {text!r}")
             continue
-        data = json.loads(match.group())
-        total_paid += Decimal(str(data["amount_paid"]))
-        subtotal = Decimal(str(data["subtotal_after_discount"]))
-        discount = Decimal(str(data["discount_total"]))
-        total_without_discount += subtotal + discount
+
+        # 三个字段各自取出现最多的值（众数）
+        paid = Counter(paid_votes).most_common(1)[0][0]
+        subtotal = Counter(subtotal_votes).most_common(1)[0][0]
+        discount = Counter(discount_votes).most_common(1)[0][0]
+
+        total_paid += Decimal(paid)
+        total_without_discount += Decimal(subtotal) + Decimal(discount)
 
     return {
         QUERY_1: f"HK${total_paid:.2f}",
